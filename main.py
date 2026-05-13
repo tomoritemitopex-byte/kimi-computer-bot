@@ -1,6 +1,9 @@
 import os
 import uuid
 import json
+import logging
+import asyncio
+import httpx
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -11,6 +14,12 @@ from sse_starlette.sse import EventSourceResponse
 from agent.llm import LLMClient
 from agent.core import Agent
 from db import init_db, close_db, save_message
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("kimi")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 @asynccontextmanager
@@ -83,8 +92,74 @@ async def stream_chat(session_id: str, request: Request):
     return EventSourceResponse(event_generator())
 
 
+# ── Telegram helpers ──────────────────────────────────────
+
+async def tg_send(chat_id: int, text: str):
+    async with httpx.AsyncClient(timeout=15) as client:
+        for chunk in _split(text, 4000):
+            await client.post(f"{TG_API}/sendMessage", json={
+                "chat_id": chat_id, "text": chunk, "parse_mode": "Markdown",
+            })
+
+def _split(text: str, n: int) -> list:
+    parts = []
+    while len(text) > n:
+        i = n
+        for s in ["\n\n", "\n", ". "]:
+            idx = text.rfind(s, 0, n)
+            if idx > n // 2: i = idx + len(s); break
+        parts.append(text[:i].strip())
+        text = text[i:].strip()
+    if text: parts.append(text)
+    return parts
+
+async def handle_tg_message(chat_id: int, text: str):
+    log.info(f"TG from {chat_id}: {text[:60]}")
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(f"{TG_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+
+    llm = LLMClient()
+    agent = Agent(llm)
+    agent.messages[0]["content"] = "You are Kimi Computer — autonomous AI agent. Use DuckDuckGo search (web_search) when asked to find information. Use tools to browse, code, run terminal, read/write files."
+    agent.messages.append({"role": "user", "content": text})
+
+    full = ""
+    async for event in agent.run():
+        if event["type"] == "final":
+            full = event["content"]
+        elif event["type"] == "tool_call":
+            log.info(f"  Tool: {event['tool']}({json.dumps(event['args'])})")
+
+    if full:
+        await tg_send(chat_id, full)
+    else:
+        await tg_send(chat_id, "No response generated.")
+
+# ── Telegram webhook endpoint ─────────────────────────────
+
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    update = await request.json()
+    msg = update.get("message", {})
+    text = msg.get("text", "").strip()
+    chat_id = msg.get("chat", {}).get("id")
+    if text and chat_id and not text.startswith("/"):
+        asyncio.ensure_future(handle_tg_message(chat_id, text))
+    return {"ok": True}
+
+@app.get("/set-webhook")
+async def set_webhook(request: Request):
+    url = str(request.base_url).rstrip("/") + "/telegram-webhook"
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(f"{TG_API}/setWebhook?url={url}&drop_pending_updates=true")
+        return r.json()
+
+# ── Start ─────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
+    log.info(f"🚀 Kimi Computer")
+    log.info(f"   Token: {'✅' if BOT_TOKEN else '❌'}")
     uvicorn.run("main:app", host=host, port=port, reload=True)
