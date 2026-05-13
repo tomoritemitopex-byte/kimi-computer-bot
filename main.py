@@ -3,6 +3,7 @@ import uuid
 import json
 import logging
 import asyncio
+import threading
 import httpx
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -142,24 +143,30 @@ async def handle_tg_message(chat_id: int, text: str):
     else:
         await tg_send(chat_id, "No response generated.")
 
-# ── Telegram webhook endpoint ─────────────────────────────
+# ── Polling loop ──────────────────────────────────────────
 
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
-    update = await request.json()
-    msg = update.get("message", {})
-    text = msg.get("text", "").strip()
-    chat_id = msg.get("chat", {}).get("id")
-    if text and chat_id and not text.startswith("/"):
-        asyncio.ensure_future(handle_tg_message(chat_id, text))
-    return {"ok": True}
-
-@app.get("/set-webhook")
-async def set_webhook(request: Request):
-    url = str(request.base_url).rstrip("/") + "/telegram-webhook"
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{TG_API}/setWebhook?url={url}&drop_pending_updates=true")
-        return r.json()
+async def polling_worker():
+    log.info("📡 Polling Telegram for messages...")
+    offset = 0
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=35) as client:
+                r = await client.post(f"{TG_API}/getUpdates", json={
+                    "offset": offset, "timeout": 30, "allowed_updates": ["message"],
+                })
+                if r.status_code != 200:
+                    await asyncio.sleep(5)
+                    continue
+                for upd in r.json().get("result", []):
+                    msg = upd.get("message", {})
+                    text = msg.get("text", "").strip()
+                    chat_id = msg.get("chat", {}).get("id")
+                    if text and chat_id and not text.startswith("/"):
+                        asyncio.ensure_future(handle_tg_message(chat_id, text))
+                    offset = upd["update_id"] + 1
+        except Exception as e:
+            log.error(f"Poll: {e}")
+            await asyncio.sleep(5)
 
 # ── Start ─────────────────────────────────────────────────
 
@@ -169,4 +176,10 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     log.info(f"🚀 Kimi Computer")
     log.info(f"   Token: {'✅' if BOT_TOKEN else '❌'}")
-    uvicorn.run("main:app", host=host, port=port, reload=True)
+
+    loop = asyncio.new_event_loop()
+    loop.create_task(polling_worker())
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+
+    uvicorn.run("main:app", host=host, port=port)
