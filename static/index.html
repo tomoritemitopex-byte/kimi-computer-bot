@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kimi Computer Bot</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0a0a0f;
+    color: #e0e0e0;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  header {
+    padding: 16px 24px;
+    border-bottom: 1px solid #1a1a2e;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 { font-size: 18px; font-weight: 600; color: #7c7cff; }
+  header .status { font-size: 12px; margin-left: auto; }
+  header .status.online { color: #4ade80; }
+  #chat {
+    flex: 1; overflow-y: auto; padding: 24px;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .msg {
+    max-width: 80%; padding: 12px 16px; border-radius: 12px;
+    line-height: 1.5; font-size: 14px; white-space: pre-wrap;
+  }
+  .msg.user {
+    background: #1a1a3e; align-self: flex-end;
+    border-bottom-right-radius: 4px; color: #c0c0ff;
+  }
+  .msg.assistant {
+    background: #1a1a2e; align-self: flex-start; border-bottom-left-radius: 4px;
+  }
+  .msg.system {
+    background: #111122; align-self: flex-start; font-size: 13px;
+    color: #888; border: 1px solid #1a1a2e;
+  }
+  .msg.tool-call {
+    background: #0d1b2a; align-self: flex-start; font-size: 13px;
+    color: #7cb8ff; border-left: 3px solid #4a7cff;
+  }
+  .msg.tool-result {
+    background: #0a1a0a; align-self: flex-start; font-size: 13px;
+    color: #7cff8a; border-left: 3px solid #4aff7c;
+    font-family: 'Courier New', monospace;
+  }
+  .msg.error {
+    background: #2a0a0a; align-self: flex-start;
+    color: #ff7c7c; border-left: 3px solid #ff4a4a;
+  }
+  .thinking {
+    align-self: flex-start; color: #666; font-size: 13px; padding: 8px 12px;
+  }
+  #input-area {
+    padding: 16px 24px; border-top: 1px solid #1a1a2e; display: flex; gap: 12px;
+    background: #0a0a0f;
+  }
+  #input {
+    flex: 1; background: #1a1a2e; border: 1px solid #2a2a4e;
+    border-radius: 8px; padding: 12px 16px; color: #e0e0e0;
+    font-size: 14px; outline: none; resize: none;
+  }
+  #input:focus { border-color: #4a4aff; }
+  #send {
+    background: #4a4aff; color: white; border: none; border-radius: 8px;
+    padding: 0 24px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  #send:hover { background: #6a6aff; }
+  #send:disabled { background: #2a2a4e; cursor: not-allowed; }
+  .model-selector {
+    background: #1a1a2e; border: 1px solid #2a2a4e; border-radius: 8px;
+    padding: 0 12px; color: #e0e0e0; font-size: 13px; outline: none; cursor: pointer;
+    height: 32px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Kimi Computer Bot</h1>
+  <select class="model-selector" id="model">
+    <option value="meta/llama-3.3-70b-instruct">Llama 3.3 70B</option>
+    <option value="mistral-nemotron">Mistral Nemotron (free)</option>
+    <option value="kimi-k2-instruct">Kimi K2 Instruct (free)</option>
+    <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
+    <option value="qwen3-coder-480b-a35b-instruct">Qwen 3 Coder 480B (free)</option>
+  </select>
+  <span class="status online">● Online</span>
+</header>
+
+<div id="chat">
+  <div class="msg system">Hello! I'm Kimi Computer — an autonomous AI agent with web browsing, code execution, terminal, and file system access. Send me a task!</div>
+</div>
+
+<div id="input-area">
+  <textarea id="input" rows="1" placeholder="Ask me anything..." oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,120)+'px'"></textarea>
+  <button id="send" onclick="sendMessage()">Send</button>
+</div>
+
+<script>
+document.getElementById('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+});
+
+async function sendMessage() {
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('send');
+  const model = document.getElementById('model').value;
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  addMessage(text, 'user');
+
+  try {
+    const res = await fetch('/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, model }),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      addMessage('Error: ' + data.error, 'error');
+      sendBtn.disabled = false;
+      return;
+    }
+
+    const es = new EventSource('/chat/' + data.session_id + '/stream');
+
+    es.addEventListener('status', e => {
+      const d = JSON.parse(e.data);
+      showThinking(d.content);
+    });
+
+    es.addEventListener('step', e => {
+      hideThinking();
+      const d = JSON.parse(e.data);
+      addMessage('Step ' + d.step + ': Thinking...', 'system');
+    });
+
+    es.addEventListener('tool_call', e => {
+      hideThinking();
+      const d = JSON.parse(e.data);
+      const args = JSON.stringify(d.args, null, 2);
+      addMessage('Tool: ' + d.tool + '\n' + args, 'tool-call');
+    });
+
+    es.addEventListener('tool_result', e => {
+      const d = JSON.parse(e.data);
+      addMessage('Result from ' + d.tool + ':\n' + d.result, 'tool-result');
+    });
+
+    es.addEventListener('final', e => {
+      hideThinking();
+      const d = JSON.parse(e.data);
+      addMessage(d.content, 'assistant');
+      es.close();
+      sendBtn.disabled = false;
+    });
+
+    es.addEventListener('error', e => {
+      hideThinking();
+      const d = JSON.parse(e.data);
+      addMessage('Error: ' + d.content, 'error');
+      es.close();
+      sendBtn.disabled = false;
+    });
+
+    es.onerror = () => {
+      hideThinking();
+      es.close();
+      sendBtn.disabled = false;
+    };
+  } catch (err) {
+    addMessage('Error: ' + err.message, 'error');
+    sendBtn.disabled = false;
+  }
+}
+
+function showThinking(text) {
+  hideThinking();
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'thinking';
+  div.id = 'thinking-indicator';
+  div.textContent = text + ' ...';
+  chat.appendChild(div);
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+function hideThinking() {
+  const el = document.getElementById('thinking-indicator');
+  if (el) el.remove();
+}
+
+function addMessage(text, type) {
+  const chat = document.getElementById('chat');
+  const div = document.createElement('div');
+  div.className = 'msg ' + type;
+  div.textContent = text;
+  chat.appendChild(div);
+  window.scrollTo(0, document.body.scrollHeight);
+}
+</script>
+</body>
+</html>

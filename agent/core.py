@@ -1,0 +1,96 @@
+import json
+import time
+from typing import AsyncGenerator
+
+from .llm import LLMClient
+from .tools import TOOL_DEFINITIONS, dispatch_tool
+
+AGENT_SYSTEM_PROMPT = """You are Kimi Computer — an autonomous AI agent with full computer access.
+
+You have these capabilities:
+1. **Web Browsing** — Fetch web pages, search the internet
+2. **Code Execution** — Run Python code in a sandbox
+3. **Terminal** — Execute shell commands (ls, cat, curl, python, etc.)
+4. **File System** — Read, write, and manage files
+
+Rules:
+- Break down complex tasks into steps
+- Use tools when needed — don't try to answer from memory alone
+- Show your thinking process
+- When writing code, prefer Python unless asked otherwise
+- Always explain what you're doing before doing it
+- If a tool fails, try an alternative approach
+- The workspace is at /tmp/workspace — use it for file operations"""
+
+
+class Agent:
+    def __init__(self, llm: LLMClient):
+        self.llm = llm
+        self.messages = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        ]
+
+    async def run(self) -> AsyncGenerator[dict, None]:
+        step = 0
+        max_steps = 10
+
+        yield {"type": "status", "content": "Starting agent..."}
+
+        while step < max_steps:
+            step += 1
+            yield {"type": "step", "content": f"Step {step}: Thinking...", "step": step}
+
+            try:
+                response = await self.llm.chat_completion(
+                    messages=self.messages,
+                    tools=TOOL_DEFINITIONS,
+                )
+            except Exception as e:
+                yield {"type": "error", "content": f"LLM call failed: {str(e)}"}
+                break
+
+            choice = response["choices"][0]
+            msg = choice["message"]
+
+            if msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn_name = tc["function"]["name"]
+                    try:
+                        fn_args = json.loads(tc["function"]["arguments"])
+                    except json.JSONDecodeError:
+                        fn_args = {}
+
+                    yield {
+                        "type": "tool_call",
+                        "tool": fn_name,
+                        "args": fn_args,
+                        "step": step,
+                    }
+
+                    result = await dispatch_tool(fn_name, fn_args)
+                    result_preview = result[:500] + "..." if len(result) > 500 else result
+
+                    yield {
+                        "type": "tool_result",
+                        "tool": fn_name,
+                        "result": result_preview,
+                        "step": step,
+                    }
+
+                    self.messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [tc],
+                    })
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": result,
+                    })
+            else:
+                content = msg.get("content", "") or ""
+                yield {"type": "final", "content": content, "step": step}
+                self.messages.append({"role": "assistant", "content": content})
+                return
+
+        yield {"type": "error", "content": "Agent reached maximum steps without a final answer."}
