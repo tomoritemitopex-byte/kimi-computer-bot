@@ -114,21 +114,28 @@ def _split(text: str, n: int) -> list:
     return parts
 
 async def handle_tg_message(chat_id: int, text: str):
-    log.info(f"TG from {chat_id}: {text[:60]}")
+    log.info(f"💬 From {chat_id}: {text[:80]}")
     async with httpx.AsyncClient(timeout=15) as client:
         await client.post(f"{TG_API}/sendChatAction", json={"chat_id": chat_id, "action": "typing"})
 
     llm = LLMClient()
     agent = Agent(llm)
-    agent.messages[0]["content"] = "You are Kimi Computer — autonomous AI agent. Use DuckDuckGo search (web_search) when asked to find information. Use tools to browse, code, run terminal, read/write files."
     agent.messages.append({"role": "user", "content": text})
 
+    step_count = 0
     full = ""
+    tool_log = []
     async for event in agent.run():
         if event["type"] == "final":
             full = event["content"]
+            if tool_log:
+                full = "🧠 *Kimi Computer*\n\n" + full + "\n\n—\n🔧 Used: " + ", ".join(tool_log)
         elif event["type"] == "tool_call":
-            log.info(f"  Tool: {event['tool']}({json.dumps(event['args'])})")
+            step_count += 1
+            tool_log.append(f"{event['tool']}")
+            log.info(f"  🔧 Step {step_count}: {event['tool']}({json.dumps(event['args'])[:80]})")
+        elif event["type"] == "error":
+            full = f"⚠️ Error: {event['content']}"
 
     if full:
         await tg_send(chat_id, full)
